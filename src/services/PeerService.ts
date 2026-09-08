@@ -1,21 +1,84 @@
 import { Peer, DataConnection } from "peerjs";
-import { ConnectionStatus, PeerMessage, ReceivedFile, FileChunk, FileCompletionSignal, SimpleFileData } from "../models/PeerData";
-import { saveAs } from "file-saver";
+import {
+    ConnectionStatus,
+    PeerMessage,
+    ReceivedFile,
+    FileControlMessage,
+    FileOffer,
+    FileAccept,
+    FileReject,
+    FileEnd,
+    IncomingFileOffer
+} from "../models/PeerData";
+
+// Read in 1MB slices - large enough to keep FileReader/JS overhead low,
+// small enough to keep at most a couple of slices in memory at once.
+const CHUNK_SIZE = 1024 * 1024;
+// Application-level backpressure: pause reading/sending more of the file
+// once this many bytes are still queued in the underlying RTCDataChannel.
+// Kept below PeerJS's own internal buffer cap so we throttle before it does.
+const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
+export function supportsFileSystemAccess(): boolean {
+    return typeof window !== "undefined" && typeof window.showSaveFilePicker === "function";
+}
+
+function generateTransferId(): string {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+        return crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+// Waits until the data channel has drained below `threshold` bytes of
+// buffered-but-unsent data, using the native bufferedamountlow event
+// instead of polling.
+function waitForBufferDrain(dataChannel: RTCDataChannel, threshold: number): Promise<void> {
+    if (dataChannel.bufferedAmount <= threshold) return Promise.resolve();
+    return new Promise((resolve) => {
+        const onLow = () => {
+            dataChannel.removeEventListener("bufferedamountlow", onLow);
+            resolve();
+        };
+        dataChannel.bufferedAmountLowThreshold = threshold;
+        dataChannel.addEventListener("bufferedamountlow", onLow);
+    });
+}
+
+interface OutgoingTransfer {
+    transferId: string;
+    file: File;
+    cancelled: boolean;
+}
+
+interface IncomingTransfer {
+    transferId: string;
+    peerId: string;
+    name: string;
+    fileType: string;
+    size: number;
+    receivedBytes: number;
+    writer: FileSystemWritableFileStream | null;
+    bufferedChunks: Uint8Array[] | null;
+}
 
 // Interface for PeerService callbacks/events
 export interface IPeerServiceCallbacks {
     onPeerIdGenerated: (peerId: string) => void;
     onConnectionStatusChanged: (status: ConnectionStatus, peerId?: string, message?: string) => void;
-    onDataReceived: (data: PeerMessage, peerId: string) => void;
+    onDataReceived: (data: string, peerId: string) => void;
+    onFileOffer: (offer: IncomingFileOffer) => void;
     onFileReceived: (file: ReceivedFile) => void;
+    onFileRejected: (transferId: string) => void;
     onTransferProgress: (progress: number) => void;
 }
 
 export class PeerService {
     private peer: Peer | null = null;
     private currentConnection: DataConnection | null = null;
-    private fileChunks: Map<string, ArrayBuffer[]> = new Map(); // Store incoming file chunks
     private callbacks: IPeerServiceCallbacks;
+    private outgoingTransfer: OutgoingTransfer | null = null;
+    private incomingTransfer: IncomingTransfer | null = null;
 
     constructor(callbacks: IPeerServiceCallbacks) {
         this.callbacks = callbacks;
@@ -85,7 +148,6 @@ export class PeerService {
             this.currentConnection = connection;
             this.callbacks.onConnectionStatusChanged(ConnectionStatus.CONNECTED, targetPeerId);
             this.setupConnectionHandlers(connection);
-            // connection.send("Olá do outro lado!"); // Test message
         });
 
         // Error handler specifically for the connection attempt
@@ -110,74 +172,72 @@ export class PeerService {
             this.peer.destroy();
             this.peer = null;
             this.currentConnection = null;
+            this.resetTransfers();
             this.callbacks.onConnectionStatusChanged(ConnectionStatus.DISCONNECTED);
             this.callbacks.onPeerIdGenerated(""); // Clear peer ID
         }
     }
 
+    /** Sends the initial offer for a file. The actual transfer only starts once the peer accepts it. */
     public sendFile(file: File): void {
         if (!this.currentConnection) {
             console.error("PeerService: Não conectado a nenhum peer.");
             this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, undefined, "Não conectado para enviar arquivo.");
             return;
         }
+        if (this.outgoingTransfer) {
+            console.warn("PeerService: Já existe um envio em andamento.");
+            return;
+        }
 
-        console.log(`PeerService: Enviando arquivo: ${file.name}, Tamanho: ${file.size}, Tipo: ${file.type}`);
+        const transferId = generateTransferId();
+        this.outgoingTransfer = { transferId, file, cancelled: false };
+
+        console.log(`PeerService: Oferecendo arquivo: ${file.name}, Tamanho: ${file.size}, Tipo: ${file.type}`);
         this.callbacks.onTransferProgress(0);
 
-        const chunkSize = 64 * 1024; // 64KB chunks
-        const totalChunks = Math.ceil(file.size / chunkSize);
-        let chunkIndex = 0;
-        let offset = 0;
-        const fileReader = new FileReader();
+        const offer: FileOffer = {
+            type: "file-offer",
+            transferId,
+            name: file.name,
+            fileType: file.type || "application/octet-stream",
+            size: file.size
+        };
+        this.currentConnection.send(offer);
+    }
 
-        fileReader.onload = (e) => {
-            if (!e.target?.result || !this.currentConnection) return;
+    /**
+     * Called (from a user-gesture handler, e.g. a button click) to accept an incoming file offer.
+     * On browsers that support it, opens a native save picker and streams the file straight to
+     * disk as chunks arrive, so memory usage stays flat regardless of file size. Falls back to
+     * buffering the whole file in memory (like before) on browsers without that API.
+     */
+    public async acceptIncomingFile(transferId: string): Promise<void> {
+        const incoming = this.incomingTransfer;
+        if (!incoming || incoming.transferId !== transferId || !this.currentConnection) return;
 
-            const chunk = e.target.result as ArrayBuffer;
-            const fileChunkData: FileChunk = {
-                name: file.name,
-                type: file.type,
-                size: file.size,
-                payload: chunk,
-                isChunk: true,
-                chunkIndex: chunkIndex,
-                totalChunks: totalChunks
-            };
-
-            console.log(`PeerService: Enviando chunk ${chunkIndex + 1}/${totalChunks}`);
-            this.currentConnection.send(fileChunkData);
-            chunkIndex++;
-            this.callbacks.onTransferProgress(Math.round((chunkIndex / totalChunks) * 100));
-
-            if (offset < file.size) {
-                readNextChunk();
-            } else {
-                console.log(`PeerService: Todos os chunks enviados para ${file.name}`);
-                // Send completion signal
-                const completionSignal: FileCompletionSignal = {
-                    name: file.name,
-                    type: file.type,
-                    size: file.size,
-                    isComplete: true
-                };
-                this.currentConnection.send(completionSignal);
+        if (supportsFileSystemAccess()) {
+            try {
+                const handle = await window.showSaveFilePicker!({ suggestedName: incoming.name });
+                incoming.writer = await handle.createWritable();
+            } catch (error) {
+                console.warn("PeerService: Salvamento direto em disco indisponível ou cancelado, usando buffer em memória.", error);
+                incoming.writer = null;
             }
-        };
+        }
+        if (!incoming.writer) {
+            incoming.bufferedChunks = [];
+        }
 
-        fileReader.onerror = (error) => {
-            console.error("PeerService: Erro ao ler arquivo:", error);
-            this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, this.currentConnection?.peer, `Erro ao ler arquivo: ${error}`);
-            this.callbacks.onTransferProgress(0);
-        };
+        const accept: FileAccept = { type: "file-accept", transferId };
+        this.currentConnection.send(accept);
+    }
 
-        const readNextChunk = () => {
-            const slice = file.slice(offset, offset + chunkSize);
-            fileReader.readAsArrayBuffer(slice);
-            offset += chunkSize;
-        };
-
-        readNextChunk(); // Start reading the first chunk
+    public rejectIncomingFile(transferId: string): void {
+        if (!this.incomingTransfer || this.incomingTransfer.transferId !== transferId) return;
+        const reject: FileReject = { type: "file-reject", transferId };
+        this.currentConnection?.send(reject);
+        this.incomingTransfer = null;
     }
 
     public sendMessage(message: string): void {
@@ -191,7 +251,6 @@ export class PeerService {
     // Private method to set up handlers for a new connection
     private setupConnectionHandlers(connection: DataConnection): void {
         connection.on("data", (data: unknown) => {
-            console.log("PeerService: Dados recebidos:", typeof data);
             this.handleReceivedData(data as PeerMessage, connection.peer);
         });
 
@@ -199,115 +258,217 @@ export class PeerService {
             console.log(`PeerService: Conexão com ${connection.peer} fechada.`);
             this.callbacks.onConnectionStatusChanged(ConnectionStatus.DISCONNECTED);
             this.currentConnection = null;
+            this.resetTransfers();
             this.callbacks.onTransferProgress(0); // Reset progress on disconnect
-            this.fileChunks.clear(); // Clear any partial transfers
         });
 
         connection.on("error", (err) => {
             console.error(`PeerService: Erro na conexão com ${connection.peer}:`, err);
             this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, connection.peer, `Erro de conexão: ${err.message}`);
             this.callbacks.onTransferProgress(0);
-            this.fileChunks.clear();
-            // Consider closing the connection if it's still open
+            this.resetTransfers();
             if (this.currentConnection && this.currentConnection.peer === connection.peer) {
                 this.currentConnection = null;
             }
         });
     }
 
-    // Private method to process received data
-    private handleReceivedData(data: PeerMessage, peerId: string): void {
-        const fileId = `${peerId}-${(data as any).name}`; // Common identifier
+    private resetTransfers(): void {
+        this.outgoingTransfer = null;
+        if (this.incomingTransfer?.writer) {
+            void this.incomingTransfer.writer.abort().catch(() => undefined);
+        }
+        this.incomingTransfer = null;
+    }
 
-        // Check if it's an object and potentially related to file transfer
-        if (typeof data === "object" && !(data instanceof ArrayBuffer) && !(data instanceof Blob) && (data as any).name) {
-            const fileData = data as Partial<FileChunk | FileCompletionSignal | SimpleFileData>;
+    // Reads the file in CHUNK_SIZE slices and streams them out, pausing whenever the
+    // underlying RTCDataChannel's send buffer gets too full (so neither side has to hold
+    // the whole file in memory to keep up).
+    private beginSendingFile(transferId: string): void {
+        const outgoing = this.outgoingTransfer;
+        const connection = this.currentConnection;
+        if (!outgoing || outgoing.transferId !== transferId || !connection) return;
 
-            // Handle chunk data (must have payload)
-            // @ts-expect-error err
-            if (fileData.isChunk && fileData.payload) {
-                if (!this.fileChunks.has(fileId)) {
-                    // @ts-expect-error err
-                    this.fileChunks.set(fileId, new Array(fileData.totalChunks).fill(null));
-                }
-                const chunks = this.fileChunks.get(fileId)!;
-                // @ts-expect-error err
-                if (typeof fileData.chunkIndex === "number" && fileData.chunkIndex >= 0 && fileData.chunkIndex < chunks.length) {
-                    // @ts-expect-error err
-                    chunks[fileData.chunkIndex] = fileData.payload as ArrayBuffer;
-                } else {
-                    // @ts-expect-error err
-                    console.error(`PeerService: Índice de chunk inválido recebido: ${fileData.chunkIndex} para ${fileData.name}`);
-                }
-                const receivedChunks = chunks.filter(c => c !== null).length;
-                // @ts-expect-error err
-                const progress = Math.round((receivedChunks / fileData.totalChunks!) * 100);
-                this.callbacks.onTransferProgress(progress);
-                // @ts-expect-error err
-                console.log(`PeerService: Recebido chunk ${fileData.chunkIndex! + 1}/${fileData.totalChunks} para ${fileData.name} (${progress}%)`);
+        const { file } = outgoing;
+        let offset = 0;
 
-            // Handle completion signal
-            // @ts-expect-error err
-            } else if (fileData.isComplete) {
-                console.log(`PeerService: Sinal de conclusão recebido para ${fileData.name}`);
-                const chunks = this.fileChunks.get(fileId);
-                if (chunks && chunks.every(c => c !== null)) {
-                    const fileBlob = new Blob(chunks, { type: fileData.type });
-                    console.log(`PeerService: Arquivo ${fileData.name} recebido completamente (chunked). Tamanho: ${fileBlob.size}`);
-                    const receivedFile: ReceivedFile = {
-                        id: fileId,
-                        name: fileData.name!,
-                        type: fileData.type!,
-                        size: fileBlob.size,
-                        blob: fileBlob
-                    };
-                    this.callbacks.onFileReceived(receivedFile);
-                    this.fileChunks.delete(fileId);
-                    this.callbacks.onTransferProgress(100);
-                    setTimeout(() => this.callbacks.onTransferProgress(0), 2000);
-                } else {
-                    console.error(`PeerService: Erro ao remontar arquivo ${fileData.name}: chunks faltando ou inválidos.`);
-                    this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, peerId, `Erro ao receber ${fileData.name}`);
-                    this.fileChunks.delete(fileId);
-                    this.callbacks.onTransferProgress(0);
-                }
-            // Handle non-chunked file data (simple transfer, must have payload)
-            // @ts-expect-error err
-            } else if (fileData.payload && !(fileData.isChunk || fileData.isComplete)) {
-                const simpleFileData = fileData as SimpleFileData;
-                const fileBlob = new Blob([simpleFileData.payload], { type: simpleFileData.type });
-                console.log(`PeerService: Arquivo ${simpleFileData.name} recebido (transferência simples). Tamanho: ${fileBlob.size}`);
-                 const receivedFile: ReceivedFile = {
-                        id: fileId,
-                        name: simpleFileData.name,
-                        type: simpleFileData.type,
-                        size: fileBlob.size,
-                        blob: fileBlob
-                    };
-                this.callbacks.onFileReceived(receivedFile);
+        console.log(`PeerService: Oferta aceita, iniciando envio de ${file.name}`);
+
+        const sendNextChunk = async (): Promise<void> => {
+            if (outgoing.cancelled || !this.currentConnection) return;
+
+            const dataChannel = connection.dataChannel;
+            if (dataChannel && dataChannel.bufferedAmount > MAX_BUFFERED_BYTES) {
+                await waitForBufferDrain(dataChannel, MAX_BUFFERED_BYTES);
+            }
+            if (outgoing.cancelled || !this.currentConnection) return;
+
+            if (offset >= file.size) {
+                const endMessage: FileEnd = { type: "file-end", transferId };
+                connection.send(endMessage);
+                this.outgoingTransfer = null;
+                console.log(`PeerService: Todos os chunks enviados para ${file.name}`);
                 this.callbacks.onTransferProgress(100);
-                setTimeout(() => this.callbacks.onTransferProgress(0), 2000);
-            } else {
-                 console.warn("PeerService: Objeto de dados de arquivo inesperado recebido:", data);
+                setTimeout(() => this.callbacks.onTransferProgress(0), 1500);
+                return;
             }
-        // Handle raw binary data
-        } else if (data instanceof ArrayBuffer || data instanceof Blob) {
-            console.log("PeerService: Dados binários brutos recebidos.");
+
             try {
-                const blob = data instanceof Blob ? data : new Blob([data]);
-                // We don't have metadata, maybe notify ViewModel/UI to ask user for filename?
-                // For now, just save with a generic name.
-                saveAs(blob, "received_binary_data");
-                console.log("PeerService: Tentativa de download iniciada para dados binários brutos.");
+                const slice = file.slice(offset, offset + CHUNK_SIZE);
+                const buffer = await slice.arrayBuffer();
+                if (outgoing.cancelled || !this.currentConnection) return;
+                // PeerJS's MsgPack serializer only recognizes typed-array views (ArrayBuffer.isView)
+                // for efficient binary encoding; a raw ArrayBuffer gets encoded as a plain object.
+                connection.send(new Uint8Array(buffer));
+                offset += buffer.byteLength;
+                this.callbacks.onTransferProgress(Math.round((offset / file.size) * 100));
+                void sendNextChunk();
             } catch (error) {
-                console.error("PeerService: Falha ao tentar baixar dados binários brutos:", error);
+                console.error("PeerService: Erro ao ler arquivo:", error);
+                this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, connection.peer, `Erro ao ler arquivo: ${error}`);
+                this.outgoingTransfer = null;
+                this.callbacks.onTransferProgress(0);
             }
-        // Handle simple string messages or other types
-        } else {
-            console.log("PeerService: Mensagem ou tipo de dados desconhecido recebido:", data);
-            // Pass non-file data up through the callback
-            this.callbacks.onDataReceived(data, peerId);
+        };
+
+        void sendNextChunk();
+    }
+
+    private handleFileOffer(offer: FileOffer, peerId: string): void {
+        if (this.incomingTransfer) {
+            console.warn("PeerService: Oferta de arquivo recebida com uma transferência já pendente; ignorando.");
+            return;
+        }
+        console.log(`PeerService: Oferta de arquivo recebida: ${offer.name} (${offer.size} bytes) de ${peerId}`);
+        this.incomingTransfer = {
+            transferId: offer.transferId,
+            peerId,
+            name: offer.name,
+            fileType: offer.fileType,
+            size: offer.size,
+            receivedBytes: 0,
+            writer: null,
+            bufferedChunks: null
+        };
+        this.callbacks.onFileOffer({
+            transferId: offer.transferId,
+            peerId,
+            name: offer.name,
+            fileType: offer.fileType,
+            size: offer.size
+        });
+    }
+
+    private handleFileReject(transferId: string): void {
+        if (this.outgoingTransfer?.transferId === transferId) {
+            this.outgoingTransfer.cancelled = true;
+            this.outgoingTransfer = null;
+        }
+        this.callbacks.onFileRejected(transferId);
+        this.callbacks.onTransferProgress(0);
+    }
+
+    private handleIncomingChunk(chunk: Uint8Array): void {
+        const incoming = this.incomingTransfer;
+        if (!incoming) {
+            console.warn("PeerService: Chunk recebido sem transferência ativa; descartado.");
+            return;
+        }
+
+        incoming.receivedBytes += chunk.byteLength;
+        const progress = incoming.size > 0 ? Math.round((incoming.receivedBytes / incoming.size) * 100) : 0;
+        this.callbacks.onTransferProgress(progress);
+
+        if (incoming.writer) {
+            incoming.writer.write(chunk).catch((error) => {
+                console.error("PeerService: Erro ao gravar chunk em disco:", error);
+                this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, incoming.peerId, "Erro ao salvar arquivo em disco.");
+            });
+        } else if (incoming.bufferedChunks) {
+            incoming.bufferedChunks.push(chunk);
         }
     }
-}
 
+    private async handleFileEnd(transferId: string): Promise<void> {
+        const incoming = this.incomingTransfer;
+        if (!incoming || incoming.transferId !== transferId) return;
+
+        this.incomingTransfer = null;
+
+        if (incoming.writer) {
+            try {
+                await incoming.writer.close();
+                console.log(`PeerService: Arquivo ${incoming.name} salvo em disco (${incoming.receivedBytes} bytes).`);
+                this.callbacks.onFileReceived({
+                    id: incoming.transferId,
+                    name: incoming.name,
+                    type: incoming.fileType,
+                    size: incoming.receivedBytes,
+                    savedToDisk: true
+                });
+            } catch (error) {
+                console.error("PeerService: Erro ao finalizar arquivo em disco:", error);
+                this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, incoming.peerId, "Erro ao finalizar arquivo em disco.");
+            }
+        } else if (incoming.bufferedChunks) {
+            const fileBlob = new Blob(incoming.bufferedChunks, { type: incoming.fileType });
+            console.log(`PeerService: Arquivo ${incoming.name} recebido em memória (${fileBlob.size} bytes).`);
+            this.callbacks.onFileReceived({
+                id: incoming.transferId,
+                name: incoming.name,
+                type: incoming.fileType,
+                size: fileBlob.size,
+                blob: fileBlob
+            });
+        }
+
+        this.callbacks.onTransferProgress(100);
+        setTimeout(() => this.callbacks.onTransferProgress(0), 1500);
+    }
+
+    private handleControlMessage(message: FileControlMessage, peerId: string): void {
+        switch (message.type) {
+            case "file-offer":
+                this.handleFileOffer(message, peerId);
+                break;
+            case "file-accept":
+                this.beginSendingFile(message.transferId);
+                break;
+            case "file-reject":
+                this.handleFileReject(message.transferId);
+                break;
+            case "file-end":
+                void this.handleFileEnd(message.transferId);
+                break;
+            default:
+                console.warn("PeerService: Mensagem de controle desconhecida recebida:", message);
+        }
+    }
+
+    // Private method to process received data
+    private handleReceivedData(data: PeerMessage, peerId: string): void {
+        if (data instanceof Uint8Array) {
+            this.handleIncomingChunk(data);
+            return;
+        }
+        if (data instanceof ArrayBuffer) {
+            this.handleIncomingChunk(new Uint8Array(data));
+            return;
+        }
+        if (data instanceof Blob) {
+            data.arrayBuffer()
+                .then((buffer) => this.handleIncomingChunk(new Uint8Array(buffer)))
+                .catch((error) => console.error("PeerService: Erro ao ler chunk recebido como Blob:", error));
+            return;
+        }
+        if (typeof data === "string") {
+            this.callbacks.onDataReceived(data, peerId);
+            return;
+        }
+        if (data && typeof data === "object" && "type" in data) {
+            this.handleControlMessage(data as FileControlMessage, peerId);
+            return;
+        }
+        console.warn("PeerService: Mensagem de tipo desconhecido recebida:", data);
+    }
+}

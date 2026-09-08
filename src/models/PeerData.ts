@@ -1,35 +1,45 @@
-export interface FileChunk {
+export interface FileOffer {
+  type: "file-offer";
+  transferId: string;
   name: string;
-  type: string;
+  fileType: string;
   size: number;
-  payload: ArrayBuffer;
-  isChunk: true;
-  chunkIndex: number;
-  totalChunks: number;
 }
 
-export interface FileCompletionSignal {
+export interface FileAccept {
+  type: "file-accept";
+  transferId: string;
+}
+
+export interface FileReject {
+  type: "file-reject";
+  transferId: string;
+}
+
+export interface FileEnd {
+  type: "file-end";
+  transferId: string;
+}
+
+export type FileControlMessage = FileOffer | FileAccept | FileReject | FileEnd;
+
+export type PeerMessage = FileControlMessage | Uint8Array | Blob | string;
+
+export interface IncomingFileOffer {
+  transferId: string;
+  peerId: string;
   name: string;
-  type: string;
+  fileType: string;
   size: number;
-  isComplete: true;
 }
-
-export interface SimpleFileData {
-    name: string;
-    type: string;
-    size: number;
-    payload: ArrayBuffer;
-}
-
-export type PeerMessage = FileChunk | FileCompletionSignal | SimpleFileData | string | ArrayBuffer | Blob;
 
 export interface ReceivedFile {
-    id: string; // Unique ID for the received file (e.g., peerId-fileName)
-    name: string;
-    type: string;
-    size: number;
-    blob: Blob;
+  id: string; // Unique ID for the received file (transferId)
+  name: string;
+  type: string;
+  size: number;
+  blob?: Blob; // present only when buffered in memory (fallback for browsers without File System Access API)
+  savedToDisk?: boolean; // true when streamed directly to disk as it arrived
 }
 
 export enum ConnectionStatus {
@@ -39,4 +49,3 @@ export enum ConnectionStatus {
     WAITING = "Aguardando conexão...",
     ERROR = "Erro"
 }
-
