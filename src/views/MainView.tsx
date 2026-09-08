@@ -19,6 +19,7 @@ function MainView() {
         connectedPeerId,
         receivedFiles,
         transferProgress,
+        transferSpeed,
         incomingOffer,
         awaitingAcceptance,
         transferNotice,
@@ -95,6 +96,8 @@ function MainView() {
         }
         return `${value.toFixed(2)} ${units[unitIndex]}`;
     };
+
+    const formatSpeed = (bytesPerSecond: number): string => `${formatBytes(bytesPerSecond)}/s`;
 
     const isConnected = connectionStatus === ConnectionStatus.CONNECTED;
     const isConnecting = connectionStatus === ConnectionStatus.CONNECTING;
@@ -219,7 +222,12 @@ function MainView() {
                                     </div>
                                 )}
                                 {transferProgress > 0 && (
-                                    <Progress value={transferProgress} className="w-full h-2 mt-2" />
+                                    <>
+                                        <Progress value={transferProgress} className="w-full h-2 mt-2" />
+                                        {transferProgress < 100 && transferSpeed > 0 && (
+                                            <p className="text-xs text-muted-foreground mt-1 text-right">{formatSpeed(transferSpeed)}</p>
+                                        )}
+                                    </>
                                 )}
                             </div>
 
@@ -247,6 +255,9 @@ function MainView() {
                     )}
                 </CardContent>
             </Card>
+            <p className="text-xs text-muted-foreground mt-2">
+                v{__APP_COMMIT_HASH__} · atualizado em {new Date(__APP_BUILD_TIME__).toLocaleString("pt-BR")}
+            </p>
             <Toaster />
         </div>
     );

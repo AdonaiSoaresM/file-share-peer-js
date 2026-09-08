@@ -45,6 +45,31 @@ function waitForBufferDrain(dataChannel: RTCDataChannel, threshold: number): Pro
     });
 }
 
+// Tracks throughput in fixed time windows (rather than a running average since
+// the transfer started) so the reported speed reflects the current rate.
+class RateTracker {
+    private windowStartMs = performance.now();
+    private windowBytes = 0;
+    private lastRateBytesPerSec = 0;
+
+    addBytes(delta: number): number {
+        this.windowBytes += delta;
+        const elapsedMs = performance.now() - this.windowStartMs;
+        if (elapsedMs >= 300) {
+            this.lastRateBytesPerSec = this.windowBytes / (elapsedMs / 1000);
+            this.windowBytes = 0;
+            this.windowStartMs = performance.now();
+        }
+        return this.lastRateBytesPerSec;
+    }
+
+    reset(): void {
+        this.windowStartMs = performance.now();
+        this.windowBytes = 0;
+        this.lastRateBytesPerSec = 0;
+    }
+}
+
 interface OutgoingTransfer {
     transferId: string;
     file: File;
@@ -70,7 +95,7 @@ export interface IPeerServiceCallbacks {
     onFileOffer: (offer: IncomingFileOffer) => void;
     onFileReceived: (file: ReceivedFile) => void;
     onFileRejected: (transferId: string) => void;
-    onTransferProgress: (progress: number) => void;
+    onTransferProgress: (progress: number, bytesPerSecond?: number) => void;
 }
 
 export class PeerService {
@@ -79,6 +104,8 @@ export class PeerService {
     private callbacks: IPeerServiceCallbacks;
     private outgoingTransfer: OutgoingTransfer | null = null;
     private incomingTransfer: IncomingTransfer | null = null;
+    private outgoingRate = new RateTracker();
+    private incomingRate = new RateTracker();
 
     constructor(callbacks: IPeerServiceCallbacks) {
         this.callbacks = callbacks;
@@ -291,6 +318,7 @@ export class PeerService {
 
         const { file } = outgoing;
         let offset = 0;
+        this.outgoingRate.reset();
 
         console.log(`PeerService: Oferta aceita, iniciando envio de ${file.name}`);
 
@@ -321,7 +349,8 @@ export class PeerService {
                 // for efficient binary encoding; a raw ArrayBuffer gets encoded as a plain object.
                 connection.send(new Uint8Array(buffer));
                 offset += buffer.byteLength;
-                this.callbacks.onTransferProgress(Math.round((offset / file.size) * 100));
+                const rate = this.outgoingRate.addBytes(buffer.byteLength);
+                this.callbacks.onTransferProgress(Math.round((offset / file.size) * 100), rate);
                 void sendNextChunk();
             } catch (error) {
                 console.error("PeerService: Erro ao ler arquivo:", error);
@@ -340,6 +369,7 @@ export class PeerService {
             return;
         }
         console.log(`PeerService: Oferta de arquivo recebida: ${offer.name} (${offer.size} bytes) de ${peerId}`);
+        this.incomingRate.reset();
         this.incomingTransfer = {
             transferId: offer.transferId,
             peerId,
@@ -377,7 +407,8 @@ export class PeerService {
 
         incoming.receivedBytes += chunk.byteLength;
         const progress = incoming.size > 0 ? Math.round((incoming.receivedBytes / incoming.size) * 100) : 0;
-        this.callbacks.onTransferProgress(progress);
+        const rate = this.incomingRate.addBytes(chunk.byteLength);
+        this.callbacks.onTransferProgress(progress, rate);
 
         if (incoming.writer) {
             incoming.writer.write(chunk).catch((error) => {

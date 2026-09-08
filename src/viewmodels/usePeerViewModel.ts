@@ -10,6 +10,7 @@ export function usePeerViewModel() {
     const [connectedPeerId, setConnectedPeerId] = useState<string | null>(null);
     const [receivedFiles, setReceivedFiles] = useState<Map<string, ReceivedFile>>(new Map());
     const [transferProgress, setTransferProgress] = useState<number>(0);
+    const [transferSpeed, setTransferSpeed] = useState<number>(0); // bytes per second
     const [lastReceivedMessage, setLastReceivedMessage] = useState<string>("");
     const [incomingOffer, setIncomingOffer] = useState<IncomingFileOffer | null>(null);
     const [awaitingAcceptance, setAwaitingAcceptance] = useState<boolean>(false);
@@ -58,9 +59,10 @@ export function usePeerViewModel() {
             setAwaitingAcceptance(false);
             setTransferNotice({ message: "O destinatário recusou o arquivo.", id: Date.now() });
         },
-        onTransferProgress: (progress) => {
+        onTransferProgress: (progress, bytesPerSecond) => {
             if (progress > 0) setAwaitingAcceptance(false);
             setTransferProgress(progress);
+            setTransferSpeed(progress > 0 && progress < 100 ? (bytesPerSecond ?? 0) : 0);
         }
     }).current; // .current ensures the object identity is stable
 
@@ -143,6 +145,7 @@ export function usePeerViewModel() {
         connectedPeerId,
         receivedFiles,
         transferProgress,
+        transferSpeed,
         lastReceivedMessage,
         incomingOffer,
         awaitingAcceptance,
