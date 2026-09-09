@@ -224,9 +224,12 @@ function MainView() {
                                 {transferProgress > 0 && (
                                     <>
                                         <Progress value={transferProgress} className="w-full h-2 mt-2" />
-                                        {transferProgress < 100 && transferSpeed > 0 && (
-                                            <p className="text-xs text-muted-foreground mt-1 text-right">{formatSpeed(transferSpeed)}</p>
-                                        )}
+                                        <div className="flex justify-between items-center mt-1">
+                                            <p className="text-xs text-muted-foreground">{transferProgress}%</p>
+                                            {transferProgress < 100 && transferSpeed > 0 && (
+                                                <p className="text-xs text-muted-foreground">{formatSpeed(transferSpeed)}</p>
+                                            )}
+                                        </div>
                                     </>
                                 )}
                             </div>
