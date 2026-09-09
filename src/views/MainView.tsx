@@ -188,8 +188,20 @@ function MainView() {
                                             Seu navegador não suporta salvamento direto em disco — arquivos muito grandes podem causar falta de memória.
                                         </p>
                                     )}
+                                    {incomingOffer.resumableBytes !== undefined && (
+                                        <p className="text-xs text-muted-foreground">
+                                            Você já tem {Math.round((incomingOffer.resumableBytes / incomingOffer.size) * 100)}% desse arquivo salvo de uma transferência anterior.
+                                        </p>
+                                    )}
                                     <div className="flex space-x-2">
-                                        <Button onClick={acceptIncomingFile} size="sm">Aceitar</Button>
+                                        {incomingOffer.resumableBytes !== undefined ? (
+                                            <>
+                                                <Button onClick={() => acceptIncomingFile(true)} size="sm">Continuar</Button>
+                                                <Button onClick={() => acceptIncomingFile(false)} size="sm" variant="secondary">Começar do zero</Button>
+                                            </>
+                                        ) : (
+                                            <Button onClick={() => acceptIncomingFile(false)} size="sm">Aceitar</Button>
+                                        )}
                                         <Button onClick={rejectIncomingFile} size="sm" variant="destructive">Recusar</Button>
                                     </div>
                                 </div>

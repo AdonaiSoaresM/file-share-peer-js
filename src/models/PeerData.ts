@@ -9,6 +9,7 @@ export interface FileOffer {
 export interface FileAccept {
   type: "file-accept";
   transferId: string;
+  resumeFromByte?: number; // byte offset the receiver already has on disk; sender starts reading from here
 }
 
 export interface FileReject {
@@ -31,6 +32,7 @@ export interface IncomingFileOffer {
   name: string;
   fileType: string;
   size: number;
+  resumableBytes?: number; // set when a matching incomplete download was found on disk
 }
 
 export interface ReceivedFile {

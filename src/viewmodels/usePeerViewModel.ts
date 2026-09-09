@@ -106,11 +106,12 @@ export function usePeerViewModel() {
     }, []);
 
     // Must be called directly from a user-gesture handler (e.g. a button's onClick) so the
-    // browser's native save-file picker is allowed to open.
-    const acceptIncomingFile = useCallback(() => {
+    // browser's native save-file picker is allowed to open. Pass resume=true to continue a
+    // previously interrupted download instead of starting over (see incomingOffer.resumableBytes).
+    const acceptIncomingFile = useCallback((resume: boolean = false) => {
         if (!incomingOffer) return;
-        console.log("ViewModel: Accepting incoming file", incomingOffer.name);
-        void peerServiceRef.current?.acceptIncomingFile(incomingOffer.transferId);
+        console.log("ViewModel: Accepting incoming file", incomingOffer.name, "resume:", resume);
+        void peerServiceRef.current?.acceptIncomingFile(incomingOffer.transferId, resume);
         setIncomingOffer(null);
     }, [incomingOffer]);
 

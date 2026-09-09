@@ -15,4 +15,13 @@ declare global {
   interface Window {
     showSaveFilePicker?(options?: SaveFilePickerOptions): Promise<FileSystemFileHandle>;
   }
+
+  interface FileSystemHandlePermissionDescriptor {
+    mode?: "read" | "readwrite";
+  }
+
+  interface FileSystemHandle {
+    queryPermission(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>;
+    requestPermission(descriptor?: FileSystemHandlePermissionDescriptor): Promise<PermissionState>;
+  }
 }

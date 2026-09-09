@@ -10,6 +10,13 @@ import {
     FileEnd,
     IncomingFileOffer
 } from "../models/PeerData";
+import {
+    makeTransferKey,
+    getStoredTransfer,
+    putStoredTransfer,
+    deleteStoredTransfer,
+    ensureReadWritePermission
+} from "./TransferStore";
 
 // Read in 1MB slices - large enough to keep FileReader/JS overhead low,
 // small enough to keep at most a couple of slices in memory at once.
@@ -18,6 +25,10 @@ const CHUNK_SIZE = 1024 * 1024;
 // once this many bytes are still queued in the underlying RTCDataChannel.
 // Kept below PeerJS's own internal buffer cap so we throttle before it does.
 const MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+// How often (in received bytes) the receiver commits progress to the real file
+// and records it in IndexedDB. Smaller = less data lost if the tab closes
+// unexpectedly, but more close/reopen overhead on the file handle.
+const CHECKPOINT_INTERVAL_BYTES = 20 * 1024 * 1024;
 
 export function supportsFileSystemAccess(): boolean {
     return typeof window !== "undefined" && typeof window.showSaveFilePicker === "function";
@@ -82,9 +93,16 @@ interface IncomingTransfer {
     name: string;
     fileType: string;
     size: number;
-    receivedBytes: number;
+    receivedBytes: number; // handed to the writer so far (may not be durable yet)
+    checkpointedBytes: number; // durably committed to disk - safe to resume from
+    bytesSinceCheckpoint: number;
     writer: FileSystemWritableFileStream | null;
+    fileHandle: FileSystemFileHandle | null;
     bufferedChunks: Uint8Array[] | null;
+    storedRecordKey: string | null;
+    // Serializes writes/checkpoints against this transfer's file handle so a
+    // periodic close+reopen never races with an in-flight chunk write.
+    writeQueue: Promise<void>;
 }
 
 // Interface for PeerService callbacks/events
@@ -238,25 +256,60 @@ export class PeerService {
      * On browsers that support it, opens a native save picker and streams the file straight to
      * disk as chunks arrive, so memory usage stays flat regardless of file size. Falls back to
      * buffering the whole file in memory (like before) on browsers without that API.
+     *
+     * Pass `resume: true` to continue a previously interrupted download of a matching file
+     * instead of starting over (see `handleFileOffer`, which detects the match).
      */
-    public async acceptIncomingFile(transferId: string): Promise<void> {
+    public async acceptIncomingFile(transferId: string, resume: boolean = false): Promise<void> {
         const incoming = this.incomingTransfer;
         if (!incoming || incoming.transferId !== transferId || !this.currentConnection) return;
 
-        if (supportsFileSystemAccess()) {
+        let resumeFromByte = 0;
+
+        if (resume && incoming.storedRecordKey) {
+            try {
+                const stored = await getStoredTransfer(incoming.storedRecordKey);
+                if (stored && (await ensureReadWritePermission(stored.fileHandle))) {
+                    incoming.fileHandle = stored.fileHandle;
+                    incoming.writer = await stored.fileHandle.createWritable({ keepExistingData: true });
+                    await incoming.writer.seek(stored.bytesOnDisk);
+                    incoming.receivedBytes = stored.bytesOnDisk;
+                    incoming.checkpointedBytes = stored.bytesOnDisk;
+                    resumeFromByte = stored.bytesOnDisk;
+                } else {
+                    console.warn("PeerService: Não foi possível retomar (permissão negada ou registro ausente); começando do zero.");
+                }
+            } catch (error) {
+                console.warn("PeerService: Falha ao retomar transferência anterior, começando do zero.", error);
+            }
+        }
+
+        if (!incoming.writer && supportsFileSystemAccess()) {
             try {
                 const handle = await window.showSaveFilePicker!({ suggestedName: incoming.name });
+                incoming.fileHandle = handle;
                 incoming.writer = await handle.createWritable();
             } catch (error) {
                 console.warn("PeerService: Salvamento direto em disco indisponível ou cancelado, usando buffer em memória.", error);
                 incoming.writer = null;
+                incoming.fileHandle = null;
             }
         }
         if (!incoming.writer) {
             incoming.bufferedChunks = [];
+        } else if (incoming.fileHandle && incoming.storedRecordKey) {
+            await putStoredTransfer({
+                key: incoming.storedRecordKey,
+                name: incoming.name,
+                size: incoming.size,
+                fileType: incoming.fileType,
+                bytesOnDisk: incoming.checkpointedBytes,
+                fileHandle: incoming.fileHandle,
+                updatedAt: Date.now()
+            }).catch((error) => console.error("PeerService: Erro ao registrar transferência para retomada:", error));
         }
 
-        const accept: FileAccept = { type: "file-accept", transferId };
+        const accept: FileAccept = { type: "file-accept", transferId, resumeFromByte };
         this.currentConnection.send(accept);
     }
 
@@ -302,25 +355,31 @@ export class PeerService {
 
     private resetTransfers(): void {
         this.outgoingTransfer = null;
-        if (this.incomingTransfer?.writer) {
-            void this.incomingTransfer.writer.abort().catch(() => undefined);
-        }
+
+        const incoming = this.incomingTransfer;
         this.incomingTransfer = null;
+        if (incoming?.writer) {
+            // Best-effort: commit whatever's been written so the download is resumable
+            // later instead of throwing away partial progress.
+            incoming.writeQueue = incoming.writeQueue
+                .then(() => this.commitCheckpoint(incoming))
+                .catch(() => incoming.writer?.abort().catch(() => undefined));
+        }
     }
 
     // Reads the file in CHUNK_SIZE slices and streams them out, pausing whenever the
     // underlying RTCDataChannel's send buffer gets too full (so neither side has to hold
     // the whole file in memory to keep up).
-    private beginSendingFile(transferId: string): void {
+    private beginSendingFile(transferId: string, resumeFromByte: number): void {
         const outgoing = this.outgoingTransfer;
         const connection = this.currentConnection;
         if (!outgoing || outgoing.transferId !== transferId || !connection) return;
 
         const { file } = outgoing;
-        let offset = 0;
+        let offset = resumeFromByte;
         this.outgoingRate.reset();
 
-        console.log(`PeerService: Oferta aceita, iniciando envio de ${file.name}`);
+        console.log(`PeerService: Oferta aceita, iniciando envio de ${file.name} a partir do byte ${offset}`);
 
         const sendNextChunk = async (): Promise<void> => {
             if (outgoing.cancelled || !this.currentConnection) return;
@@ -363,13 +422,29 @@ export class PeerService {
         void sendNextChunk();
     }
 
-    private handleFileOffer(offer: FileOffer, peerId: string): void {
+    private async handleFileOffer(offer: FileOffer, peerId: string): Promise<void> {
         if (this.incomingTransfer) {
             console.warn("PeerService: Oferta de arquivo recebida com uma transferência já pendente; ignorando.");
             return;
         }
         console.log(`PeerService: Oferta de arquivo recebida: ${offer.name} (${offer.size} bytes) de ${peerId}`);
         this.incomingRate.reset();
+
+        const storedRecordKey = supportsFileSystemAccess()
+            ? makeTransferKey(offer.name, offer.size, offer.fileType)
+            : null;
+        let resumableBytes: number | undefined;
+        if (storedRecordKey) {
+            try {
+                const stored = await getStoredTransfer(storedRecordKey);
+                if (stored && stored.bytesOnDisk > 0 && stored.bytesOnDisk < offer.size) {
+                    resumableBytes = stored.bytesOnDisk;
+                }
+            } catch (error) {
+                console.warn("PeerService: Erro ao consultar transferências salvas:", error);
+            }
+        }
+
         this.incomingTransfer = {
             transferId: offer.transferId,
             peerId,
@@ -377,15 +452,21 @@ export class PeerService {
             fileType: offer.fileType,
             size: offer.size,
             receivedBytes: 0,
+            checkpointedBytes: 0,
+            bytesSinceCheckpoint: 0,
             writer: null,
-            bufferedChunks: null
+            fileHandle: null,
+            bufferedChunks: null,
+            storedRecordKey,
+            writeQueue: Promise.resolve()
         };
         this.callbacks.onFileOffer({
             transferId: offer.transferId,
             peerId,
             name: offer.name,
             fileType: offer.fileType,
-            size: offer.size
+            size: offer.size,
+            resumableBytes
         });
     }
 
@@ -396,6 +477,37 @@ export class PeerService {
         }
         this.callbacks.onFileRejected(transferId);
         this.callbacks.onTransferProgress(0);
+    }
+
+    // Closes the current writer to durably commit everything written so far, and
+    // records that checkpoint in IndexedDB. Leaves `incoming.writer` null.
+    private async commitCheckpoint(incoming: IncomingTransfer): Promise<void> {
+        if (!incoming.writer || !incoming.fileHandle) return;
+        const committedBytes = incoming.checkpointedBytes + incoming.bytesSinceCheckpoint;
+        await incoming.writer.close();
+        incoming.writer = null;
+        incoming.checkpointedBytes = committedBytes;
+        incoming.bytesSinceCheckpoint = 0;
+        if (incoming.storedRecordKey) {
+            await putStoredTransfer({
+                key: incoming.storedRecordKey,
+                name: incoming.name,
+                size: incoming.size,
+                fileType: incoming.fileType,
+                bytesOnDisk: incoming.checkpointedBytes,
+                fileHandle: incoming.fileHandle,
+                updatedAt: Date.now()
+            }).catch((error) => console.error("PeerService: Erro ao salvar checkpoint:", error));
+        }
+    }
+
+    // Same as commitCheckpoint, but reopens the file (positioned at the end) so more
+    // chunks can keep being written - used for periodic mid-transfer checkpoints.
+    private async checkpointAndContinue(incoming: IncomingTransfer): Promise<void> {
+        await this.commitCheckpoint(incoming);
+        if (!incoming.fileHandle) return;
+        incoming.writer = await incoming.fileHandle.createWritable({ keepExistingData: true });
+        await incoming.writer.seek(incoming.checkpointedBytes);
     }
 
     private handleIncomingChunk(chunk: Uint8Array): void {
@@ -411,10 +523,20 @@ export class PeerService {
         this.callbacks.onTransferProgress(progress, rate);
 
         if (incoming.writer) {
-            incoming.writer.write(chunk).catch((error) => {
-                console.error("PeerService: Erro ao gravar chunk em disco:", error);
-                this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, incoming.peerId, "Erro ao salvar arquivo em disco.");
-            });
+            incoming.bytesSinceCheckpoint += chunk.byteLength;
+            // Chain onto the same queue used for checkpoints so a close()/reopen() cycle
+            // never runs concurrently with a write() on the handle it's replacing.
+            incoming.writeQueue = incoming.writeQueue
+                .then(() => incoming.writer!.write(chunk))
+                .then(() => {
+                    if (incoming.bytesSinceCheckpoint >= CHECKPOINT_INTERVAL_BYTES) {
+                        return this.checkpointAndContinue(incoming);
+                    }
+                })
+                .catch((error) => {
+                    console.error("PeerService: Erro ao gravar chunk em disco:", error);
+                    this.callbacks.onConnectionStatusChanged(ConnectionStatus.ERROR, incoming.peerId, "Erro ao salvar arquivo em disco.");
+                });
         } else if (incoming.bufferedChunks) {
             incoming.bufferedChunks.push(chunk);
         }
@@ -428,7 +550,11 @@ export class PeerService {
 
         if (incoming.writer) {
             try {
+                await incoming.writeQueue;
                 await incoming.writer.close();
+                if (incoming.storedRecordKey) {
+                    await deleteStoredTransfer(incoming.storedRecordKey).catch(() => undefined);
+                }
                 console.log(`PeerService: Arquivo ${incoming.name} salvo em disco (${incoming.receivedBytes} bytes).`);
                 this.callbacks.onFileReceived({
                     id: incoming.transferId,
@@ -460,10 +586,10 @@ export class PeerService {
     private handleControlMessage(message: FileControlMessage, peerId: string): void {
         switch (message.type) {
             case "file-offer":
-                this.handleFileOffer(message, peerId);
+                void this.handleFileOffer(message, peerId);
                 break;
             case "file-accept":
-                this.beginSendingFile(message.transferId);
+                this.beginSendingFile(message.transferId, message.resumeFromByte ?? 0);
                 break;
             case "file-reject":
                 this.handleFileReject(message.transferId);
